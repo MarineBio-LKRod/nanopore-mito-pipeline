@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# 0) Setup paths + folders
+# =========================
+
+# Reference mitogenome FASTA (NC_002503.2)
+REF="sperm_whale_mito_ref.fasta"
+
+# Threads (adjust)
+THREADS=8
+
+# Create output directories
+mkdir -p trimmed logs bam medaka_out consensus variants_medaka variants_medaka_filtered snp_tables depth
+
+# Check required tools exist
+for exe in cutadapt minimap2 samtools bcftools; do
+  command -v "$exe" >/dev/null 2>&1 || { echo "[ERROR] Missing $exe in PATH"; exit 1; }
+done
+
+# ==========================================
+# 0.1) Define barcodes from input FASTQ files
+# ==========================================
+# Supports both .fastq and .fastq.gz
+mapfile -t FASTQS < <(ls -1 SQK-NBD114-96_barcode*.fastq* 2>/dev/null || true)
+if [[ ${#FASTQS[@]} -eq 0 ]]; then
+  echo "[ERROR] No input files found matching SQK-NBD114-96_barcode*.fastq*"
+  exit 1
+fi
+
+# Extract barcode IDs as two-digit strings (01, 02, ...)
+BARCODES=()
+for f in "${FASTQS[@]}"; do
+  bn=$(basename "$f")
+  bc=$(echo "$bn" | sed -E 's/^SQK-NBD114-96_barcode([0-9]+)\.fastq(\.gz)?$/\1/')
+  BARCODES+=("$bc")
+done
+
+echo "[INFO] Found barcodes: ${BARCODES[*]}"
+
+# =====================================
+# 1) Primer trimming with Cutadapt
+# =====================================
+for BC in "${BARCODES[@]}"; do
+  IN="SQK-NBD114-96_barcode${BC}.fastq"
+  [[ -f "$IN" ]] || IN="SQK-NBD114-96_barcode${BC}.fastq.gz"
+
+  OUT="trimmed/barcode${BC}_trimmed.fastq"
+  LOG="logs/barcode${BC}_cutadapt.log"
+
+  echo "$(date) [Cutadapt] barcode${BC}"
+  cutadapt \
+    --overlap 15 \
+    --front 'AATCCAGGTGCGGTTCTATCT' \
+    --front 'GTTGGAKTCTCTTCTTTCCTTCC' \
+    --front 'GAGAGGCMTTYRCATCCAAACG' \
+    --front 'GGTAGGGTAGGAAG' \
+    --front 'CGATCCACCTAAATTCCTGCA' \
+    --front 'GCTCAGGGCTTGGTATAAGGA' \
+    --front 'GCCTYAACCAACTYAACTRGG' \
+    --front 'GTGCTTGATACCWGCTTCCTTT' \
+    --front 'AAAGCAADACACTGAGAGATGNT' \
+    --front 'TARACRGYYAGGCAGATATTGC' \
+    -e 0.1 -O 15 \
+    --match-read-wildcards \
+    -o "$OUT" \
+    "$IN" \
+    > "$LOG" 2>&1
+done
+
+# ============================================
+# 2) Map trimmed reads to mito (minimap2 + samtools)
+# ============================================
+# Using minimap2 preset map-ont and --secondary=no, then sort+index
+for BC in "${BARCODES[@]}"; do
+  IN="trimmed/barcode${BC}_trimmed.fastq"
+  OUTBAM="bam/barcode${BC}_clean.bam"
+
+  echo "$(date) [minimap2] barcode${BC}"
+  minimap2 -ax map-ont --secondary=no -Y "$REF" "$IN" \
+    | samtools sort -o "$OUTBAM" -
+  samtools index "$OUTBAM"
+done
+
+# ======================================================
+# 3) Summarize mapped reads and keep barcodes >= 1000
+# ======================================================
+# Uses samtools idxstats (mito is first contig if REF has only mito)
+echo -e "barcode\tmapped_reads" > mapping_summary.tsv
+for BAM in bam/barcode*_clean.bam; do
+  bc=$(basename "$BAM" | sed -E 's/^barcode([0-9]+)_clean\.bam$/\1/')
+  mapped=$(samtools idxstats "$BAM" | awk 'NR==1 {print $3}')
+  echo -e "${bc}\t${mapped}" >> mapping_summary.tsv
+done
+
+# Define BARCODES_GOOD (>=1000 mapped reads)
+mapfile -t BARCODES_GOOD < <(awk 'NR>1 && $2>=1000 {print $1}' mapping_summary.tsv)
+echo "[INFO] Good barcodes (>=1000 mapped reads): ${BARCODES_GOOD[*]}"
+
+if [[ ${#BARCODES_GOOD[@]} -eq 0 ]]; then
+  echo "[ERROR] No barcodes passed >=1000 mapped reads. Stopping."
+  exit 1
+fi
+
+# ============================================
+# 4) Medaka polishing (consensus per barcode)
+# ============================================
+# Uses r1041_e82_400bps_sup_v4.3.0
+for BC in "${BARCODES_GOOD[@]}"; do
+  BAM="bam/barcode${BC}_clean.bam"
+  OUTDIR="medaka_out/barcode${BC}"
+
+  echo "$(date) [Medaka] barcode${BC}"
+  medaka_consensus \
+    -i "$BAM" \
+    -d "$REF" \
+    -o "$OUTDIR" \
+    -m r1041_e82_400bps_sup_v4.3.0 \
+    -t "$THREADS"
+done
+
+# ==================================================
+# 5) Combine consensus FASTA + MAFFT
+# ==================================================
+OUTCONS="consensus/combined_consensus_with_ref.fasta"
+cp "$REF" "$OUTCONS"
+
+for BC in "${BARCODES_GOOD[@]}"; do
+  CONS="medaka_out/barcode${BC}/consensus.fasta"
+  if [[ ! -f "$CONS" ]]; then
+    echo "[WARN] Missing $CONS, skipping barcode${BC}" >&2
+    continue
+  fi
+
+  # Rename header to barcodeXX for clarity
+  {
+    read -r _oldhdr
+    echo ">barcode${BC}"
+    cat
+  } < "$CONS" >> "$OUTCONS"
+done
+
+mafft --auto "$OUTCONS" > consensus/mito_alignment_with_ref.fasta
+
+# ============================================
+# 6) Variant calling per barcode (bcftools)
+# ============================================
+# Uses Medaka's calls_to_draft.bam, with MAPQ>=10 (-q 10) and BaseQ>=7 (-Q 7)
+# Keeps biallelic SNPs only
+for BC in "${BARCODES_GOOD[@]}"; do
+  BAM="medaka_out/barcode${BC}/calls_to_draft.bam"
+  RAW_VCF="variants_medaka/barcode${BC}_raw.vcf.gz"
+
+  if [[ ! -f "$BAM" ]]; then
+    echo "[WARN] Missing $BAM, skipping barcode${BC}" >&2
+    continue
+  fi
+
+  echo "$(date) [bcftools call] barcode${BC}"
+  bcftools mpileup -Ou -f "$REF" -q 10 -Q 7 "$BAM" \
+    | bcftools call -mv -Ou \
+    | bcftools norm -f "$REF" -Ou \
+    | bcftools view -m2 -M2 -v snps -Oz -o "$RAW_VCF"
+  bcftools index "$RAW_VCF"
+done
+
+# ============================================
+# 7) Filter variants (QUAL, DP, VAF via DP4)
+# ============================================
+# QUAL>30 && DP>=100 && ALT_reads >= 0.15*DP  (ALT_reads = DP4[2]+DP4[3] in bcftools indexing)
+for BC in "${BARCODES_GOOD[@]}"; do
+  IN_VCF="variants_medaka/barcode${BC}_raw.vcf.gz"
+  OUT_VCF="variants_medaka_filtered/barcode${BC}_filtered.vcf.gz"
+
+  if [[ ! -f "$IN_VCF" ]]; then
+    echo "[WARN] Missing $IN_VCF, skipping barcode${BC}" >&2
+    continue
+  fi
+
+  echo "$(date) [bcftools filter] barcode${BC}"
+  bcftools filter \
+    -i 'QUAL>30 && INFO/DP>=100 && (INFO/DP4[2]+INFO/DP4[3]) >= 0.15*INFO/DP' \
+    -Oz -o "$OUT_VCF" "$IN_VCF"
+  bcftools index -t "$OUT_VCF"
+done
+
+# ==========================================================
+# 8) Export combined SNP table (TSV) for downstream R
+# ==========================================================
+# Extracts DP and DP4, computes ALT_DEPTH and VAF = ALT_DEPTH/DP
+OUTTSV="snp_tables/combined_snp_table.tsv"
+echo -e "sample\tCHROM\tPOS\tREF\tALT\tQUAL\tDP\tALT_DEPTH\tVAF" > "$OUTTSV"
+
+for BC in "${BARCODES_GOOD[@]}"; do
+  VCF="variants_medaka_filtered/barcode${BC}_filtered.vcf.gz"
+  if [[ ! -f "$VCF" ]]; then
+    echo "[WARN] Missing $VCF, skipping barcode${BC}" >&2
+    continue
+  fi
+
+  bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%INFO/DP\t%INFO/DP4\n" "$VCF" \
+    | awk -v bc="barcode${BC}" '{
+        chrom=$1; pos=$2; ref=$3; alt=$4; qual=$5; dp=$6;
+        split($7, dp4, ",");
+        # dp4 = ref_fwd, ref_rev, alt_fwd, alt_rev
+        alt_depth = dp4[3] + dp4[4];
+        vaf = (dp>0 ? alt_depth/dp : 0);
+        print bc"\t"chrom"\t"pos"\t"ref"\t"alt"\t"qual"\t"dp"\t"alt_depth"\t"vaf
+      }' >> "$OUTTSV"
+done
+
+echo "[DONE] Combined SNP table written to: $OUTTSV"
+echo "[NEXT] Move snp_tables/combined_snp_table.tsv into R for Tier-3 QC / haplotyping."
